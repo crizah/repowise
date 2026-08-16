@@ -108,6 +108,7 @@ from .parser_helpers import (
     _qualified_cpp_parent,
     _qualified_pascal_parent,
     _run_query,
+    _rust_shadowed_by_type_param,
 )
 from .python_local_refs import extract_python_local_refs
 from .sfc_source import component_call_sites, prepare_source
@@ -2149,6 +2150,11 @@ class ASTParser:
             # query predicate can see the parent that tells them apart. Left
             # in, every function in the repo would call itself.
             if file_info.language == "elixir" and _elixir_call_is_definitional(site_node, src):
+                continue
+
+            if file_info.language == "rust" and _rust_shadowed_by_type_param(
+                target_nodes[0], target_name, src
+            ):
                 continue
 
             line = site_node.start_point[0] + 1
