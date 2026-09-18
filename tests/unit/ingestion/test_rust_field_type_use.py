@@ -3,13 +3,17 @@
 Covers the chain that turns a Rust field's type annotation into a graph
 edge the dead-code analyzer can read:
 
-* ``field_declaration``'s ``type:`` node now captured as ``@call.target`` in
-  ``rust.scm`` (plain, scoped ``super::``/``crate::`` paths, and references);
+* ``field_declaration``'s ``type:`` node captured as ``@param.type`` in
+  ``rust.scm``, one pattern covering plain, ``&T``, scoped
+  ``super::``/``crate::`` and ``Option<T>`` shapes because the Rust head
+  extractor unwraps them;
 * ``type_arguments`` generalised beyond the existing ``dyn Trait`` case, so
   a type nested in ``Option<T>`` / ``Vec<T>`` is also captured;
-* the existing ``CallResolver`` free-call tiers (same-file, then
-  cross-file global-unique-name) turn that capture into a ``calls`` edge
-  with no changes to the resolver itself;
+* ``_extract_type_refs`` turning those into ``TypeReference`` records and
+  ``_resolve_rust_type_refs`` resolving them into a file-level ``type_use``
+  edge. A type is not callable, so these positions deliberately do not mint
+  ``calls`` edges (see the note above the type-reference section in
+  ``rust.scm``);
 * the end-to-end dead-code outcome: a struct used only as a field type,
   including across files via a path-qualified reference with no ``use``
   statement, is no longer flagged as an unused export — while a genuinely
@@ -63,22 +67,32 @@ def _file_info(path: str, abs_path: str) -> FileInfo:
 
 
 class TestRustFieldTypeCapture:
+    def _type_refs(self, body: str) -> set[str]:
+        info = _file_info("p/f.rs", "/repo/p/f.rs")
+        parsed = _PARSER.parse_file(info, body.encode("utf-8"))
+        return {r.type_name for r in parsed.type_refs}
+
     def _calls(self, body: str) -> set[str]:
         info = _file_info("p/f.rs", "/repo/p/f.rs")
         parsed = _PARSER.parse_file(info, body.encode("utf-8"))
         return {c.target_name for c in parsed.calls}
 
     def test_plain_struct_field_type_captured(self) -> None:
-        names = self._calls("pub struct Foo { bar: Bar }\n")
+        names = self._type_refs("pub struct Foo { bar: Bar }\n")
         assert "Bar" in names
 
+    def test_field_type_is_not_captured_as_a_call(self) -> None:
+        # A type is not callable. These positions mint a file-level
+        # ``type_use`` edge, never ``Foo -> Bar`` in the call graph.
+        assert "Bar" not in self._calls("pub struct Foo { bar: Bar }\n")
+
     def test_scoped_struct_field_type_captured(self) -> None:
-        names = self._calls("pub struct Foo { bar: super::Bar }\n")
+        names = self._type_refs("pub struct Foo { bar: super::Bar }\n")
         assert "Bar" in names
 
     def test_enum_struct_variant_field_type_captured(self) -> None:
         # enum_variant reuses field_declaration for its struct-like body.
-        names = self._calls(
+        names = self._type_refs(
             "pub enum Event {\n"
             "    Received { state: Bar },\n"
             "}\n"
@@ -87,7 +101,7 @@ class TestRustFieldTypeCapture:
 
     def test_generic_wrapped_scoped_field_type_captured(self) -> None:
         # The reported false positive's exact shape: Option<super::Bar>.
-        names = self._calls(
+        names = self._type_refs(
             "pub enum Event {\n"
             "    Received { state: Option<super::Bar> },\n"
             "}\n"
@@ -95,7 +109,7 @@ class TestRustFieldTypeCapture:
         assert "Bar" in names
 
     def test_reference_field_type_captured(self) -> None:
-        names = self._calls("pub struct Foo<'a> { bar: &'a Bar }\n")
+        names = self._type_refs("pub struct Foo<'a> { bar: &'a Bar }\n")
         assert "Bar" in names
 
     def test_generic_type_param_not_captured_as_reference(self) -> None:
@@ -103,7 +117,7 @@ class TestRustFieldTypeCapture:
         # a struct named `Item` — the two are indistinguishable as bare
         # `type_identifier` nodes without checking the enclosing
         # `type_parameters` list.
-        names = self._calls("pub struct Wrapper<Item> { pub value: Item }\n")
+        names = self._type_refs("pub struct Wrapper<Item> { pub value: Item }\n")
         assert "Item" not in names
 
 
@@ -151,9 +165,16 @@ def _build_graph(repo: Path) -> nx.DiGraph:
 
 
 class TestRustFieldTypeUseEdge:
-    def test_cross_file_field_type_produces_calls_edge(self, tmp_path: Path) -> None:
+    def test_cross_file_field_type_produces_type_use_edge(self, tmp_path: Path) -> None:
         graph = _build_graph(tmp_path)
-        assert graph.has_edge(
+        src, dst = "src/transport/types.rs", "src/transport/state.rs"
+        assert graph.has_edge(src, dst)
+        assert graph[src][dst].get("edge_type") == "type_use"
+
+    def test_cross_file_field_type_produces_no_call_edge(self, tmp_path: Path) -> None:
+        # The enclosing item does not call the type it holds.
+        graph = _build_graph(tmp_path)
+        assert not graph.has_edge(
             "src/transport/types.rs::Received",
             "src/transport/state.rs::RecvState",
         )
@@ -226,6 +247,16 @@ class TestRustGenericTypeParamCollision:
     def test_no_edge_from_shadowed_type_param(self, tmp_path: Path) -> None:
         graph = self._build_graph(tmp_path)
         assert not graph.has_edge("src/lib.rs::Wrapper", "src/lib.rs::Item")
+
+    def test_shadowed_type_param_is_not_a_type_reference(self, tmp_path: Path) -> None:
+        # The guard has to hold on the type-reference path, which is where
+        # these captures now land. ``Item`` names the type parameter, so it
+        # must not be recorded as referencing the struct of the same name.
+        body = "pub struct Item { pub id: u32 }" + chr(10)
+        body += "pub struct Wrapper<Item> { pub value: Item }" + chr(10)
+        info = _file_info("src/lib.rs", "/repo/src/lib.rs")
+        parsed = _PARSER.parse_file(info, body.encode("utf-8"))
+        assert "Item" not in {r.type_name for r in parsed.type_refs}
 
     def test_shadowed_struct_still_flagged_unused_export(self, tmp_path: Path) -> None:
         graph = self._build_graph(tmp_path)
